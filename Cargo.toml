@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
-name="h3ntai"
+name="h3_ntai"
 path="src/lib.rs"
 
 [[example]]
