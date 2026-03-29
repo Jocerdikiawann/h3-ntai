@@ -16,7 +16,7 @@ name="client"
 path="examples/client.rs"
 
 [dependencies]
-quiche = { version = "0.24.7", features = ["boringssl-boring-crate"] }
+quiche = { version = "0.26.1", features = ["boringssl-boring-crate"] }
 tokio = { version = "1.49", features = ["full"] }
 bytes = "1.11.1"
 ring = "0.17.14"

@@ -1,4 +1,4 @@
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 use quiche::h3::NameValue;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -134,10 +134,6 @@ impl H3Server {
         let mut out = BytesMut::zeroed(1350);
 
         loop {
-            // let from: SocketAddr;
-            // let pkt_len: usize;
-            // let is_incoming_packet: bool;
-
             enum Event {
                 Packet { len: usize, from: SocketAddr },
                 Response(PendingResponse),
@@ -352,7 +348,7 @@ impl H3Server {
                         Self::process_h3_events(&conn_arc, req_handler.as_ref(), &resp_tx).await;
                     }
 
-                    Self::process_realtime_streams(&conn_arc, &channel).await;
+                    Self::process_realtime_streams(&conn_arc, &channel, &socket).await;
                     Self::process_datagrams(&conn_arc, &channel, &socket).await;
 
                     {
@@ -469,6 +465,15 @@ impl H3Server {
                                 }
                             }
                         });
+
+                        let _ = conn
+                            .realtime_tx
+                            .send(RealtimeEvent::Join {
+                                conn_id: conn.conn_id.clone(),
+                                channel: msg.channel.clone(),
+                                stream_id: session_id,
+                            })
+                            .await;
                     } else if msg.event == "leave" {
                         channel.unsubscribe(&msg.channel, &conn.conn_id).await;
 
@@ -550,13 +555,19 @@ impl H3Server {
                         let mut h3g = conn.h3.lock().await;
 
                         if let Some(h3) = h3g.as_mut() {
-                            if let Err(e) =
+                            if let Ok(_) =
                                 h3.send_response(&mut *quic, stream_id, &rep_headers, false)
                             {
-                                error!("Failed send response webtransport: {e}");
-                            } else {
-                                info!(
-                                    "Session webtransport success created, session id: {stream_id}"
+                                info!("web transport session established: {}", stream_id);
+                                let mut streams = conn.streams.lock().await;
+                                streams.insert(
+                                    stream_id,
+                                    StreamMeta {
+                                        stream_id,
+                                        stream_type: StreamType::Realtime,
+                                        channel: None,
+                                        buffer: BytesMut::with_capacity(8192),
+                                    },
                                 );
                             }
                         }
@@ -564,7 +575,7 @@ impl H3Server {
                         continue;
                     }
 
-                    debug!("H3 {method} {path} stream={stream_id}");
+                    info!("H3 {method} {path} stream={stream_id}");
                     pending.insert(
                         stream_id,
                         H3Request {
@@ -579,19 +590,20 @@ impl H3Server {
                 }
 
                 (stream_id, quiche::h3::Event::Data) => {
-                    let mut body_buf = BytesMut::zeroed(65535);
-                    let n = {
-                        let mut quic = conn.quic.lock().await;
-                        let mut h3g = conn.h3.lock().await;
-                        h3g.as_mut()
-                            .map(|h| {
-                                h.recv_body(&mut *quic, stream_id, &mut body_buf)
-                                    .unwrap_or(0)
-                            })
-                            .unwrap_or(0)
-                    };
-                    if let Some(req) = pending.get_mut(&stream_id) {
-                        req.body.extend_from_slice(&body_buf[..n]);
+                    let mut quic = conn.quic.lock().await;
+                    let mut h3g = conn.h3.lock().await;
+                    let mut streams = conn.streams.lock().await;
+
+                    if let Some(h3) = h3g.as_mut() {
+                        let mut body_buf = bytes::BytesMut::zeroed(65535);
+
+                        while let Ok(read) = h3.recv_body(&mut *quic, stream_id, &mut body_buf) {
+                            if let Some(req) = pending.get_mut(&stream_id) {
+                                req.body.extend_from_slice(&body_buf[..read]);
+                            } else if let Some(meta) = streams.get_mut(&stream_id) {
+                                meta.buffer.extend_from_slice(&body_buf[..read]);
+                            }
+                        }
                     }
                 }
 
@@ -623,89 +635,84 @@ impl H3Server {
         }
     }
 
-    async fn process_realtime_streams(conn: &Arc<QuicConnection>, channel: &Arc<RealtimeChannel>) {
-        let readable: Vec<u64> = conn.quic.lock().await.readable().collect();
+    async fn process_realtime_streams(
+        conn: &Arc<QuicConnection>,
+        channel: &Arc<RealtimeChannel>,
+        socket: &Arc<UdpSocket>,
+    ) {
+        let mut streams = conn.streams.lock().await;
 
-        for stream_id in readable {
-            {
-                let streams = conn.streams.lock().await;
-                if let Some(meta) = streams.get(&stream_id) {
-                    if meta.stream_type != StreamType::Realtime {
-                        continue;
-                    }
-                }
+        for (&stream_id, meta) in streams.iter_mut() {
+            if meta.stream_type != StreamType::Realtime {
+                continue;
             }
 
-            let mut buf = BytesMut::zeroed(65535);
-            let n = {
-                let mut quic = conn.quic.lock().await;
-                match quic.stream_recv(stream_id, &mut buf) {
-                    Ok((n, _)) => n,
-                    Err(quiche::Error::Done) => continue,
-                    Err(e) => {
-                        warn!("stream_recv {stream_id}: {e}");
-                        continue;
-                    }
-                }
-            };
-
-            let mut tmp = buf[..n].to_vec();
-            while let Some((msg, consumed)) = parse_realtime_frame(&tmp) {
-                tmp.drain(..consumed);
+            while let Some((msg, consumed)) = parse_realtime_frame(&meta.buffer) {
+                use bytes::Buf;
+                meta.buffer.advance(consumed);
 
                 if msg.event == "join" {
-                    let ch = msg.channel.clone();
-                    let cid = conn.conn_id.clone();
-                    let mut rx = channel.subscribe(&ch, &cid).await;
+                    let ch_name = msg.channel.clone();
+                    meta.channel = Some(ch_name.clone());
 
-                    conn.streams.lock().await.insert(
-                        stream_id,
-                        StreamMeta {
-                            stream_id,
-                            stream_type: StreamType::Realtime,
-                            channel: Some(ch.clone()),
-                        },
-                    );
+                    let mut rx = channel.subscribe(&ch_name, &conn.conn_id).await;
+                    let conn_c = Arc::clone(conn);
+                    let socket_c = Arc::clone(socket);
+                    let peer_addr = conn.peer_addr;
 
+                    tokio::spawn(async move {
+                        while let Some(bcast) = rx.recv().await {
+                            let mut quic = conn_c.quic.lock().await;
+                            let mut h3g = conn_c.h3.lock().await;
+
+                            if let Some(h3) = h3g.as_mut() {
+                                if let Err(e) = h3.send_body(&mut *quic, stream_id, &bcast, false) {
+                                    if !matches!(e, quiche::h3::Error::Done) {
+                                        break;
+                                    }
+                                }
+                            }
+
+                            let mut out = bytes::BytesMut::zeroed(1350);
+                            loop {
+                                match quic.send(&mut out) {
+                                    Ok((w, _)) => {
+                                        let _ = socket_c.send_to(&out[..w], peer_addr).await;
+                                    }
+                                    _ => break,
+                                }
+                            }
+                        }
+                    });
                     let _ = conn
                         .realtime_tx
                         .send(RealtimeEvent::Join {
-                            conn_id: cid,
-                            channel: ch,
+                            conn_id: conn.conn_id.clone(),
+                            channel: ch_name,
                             stream_id,
                         })
                         .await;
+                } else if msg.event == "leave" {
+                    if let Some(ch) = &meta.channel {
+                        channel.unsubscribe(ch, &conn.conn_id).await;
 
-                    let conn_c = Arc::clone(conn);
-                    tokio::spawn(async move {
-                        while let Some(bcast) = rx.recv().await {
-                            let _ = conn_c
-                                .quic
-                                .lock()
-                                .await
-                                .stream_send(stream_id, &bcast, false);
-                        }
-                    });
-                } else {
-                    let ch_name = conn
-                        .streams
-                        .lock()
-                        .await
-                        .get(&stream_id)
-                        .and_then(|m| m.channel.clone());
-                    if let Some(ch) = ch_name {
-                        channel
-                            .broadcast(&ch, msg.clone(), Some(&conn.conn_id))
-                            .await;
                         let _ = conn
                             .realtime_tx
-                            .send(RealtimeEvent::Message {
+                            .send(RealtimeEvent::Leave {
                                 conn_id: conn.conn_id.clone(),
-                                stream_id,
-                                msg,
+                                channel: ch.clone(),
                             })
                             .await;
                     }
+                } else {
+                    let _ = conn
+                        .realtime_tx
+                        .send(RealtimeEvent::Message {
+                            conn_id: conn.conn_id.clone(),
+                            stream_id,
+                            msg,
+                        })
+                        .await;
                 }
             }
         }

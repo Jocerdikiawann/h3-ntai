@@ -4,6 +4,7 @@ use message::Message;
 use airnomads::{
     H3Client, QuicConfig,
     error::{H3Error, Result},
+    realtime::RealtimeMode,
 };
 
 use std::net::AddrParseError;
@@ -50,7 +51,9 @@ async fn main() -> Result<()> {
     );
 
     info!("=== Realtime: joining channel 'chat' ===");
-    let stream = conn.realtime_connect("chat").await?;
+    let stream = conn
+        .realtime_connect("chat", RealtimeMode::Reliable)
+        .await?;
 
     let (tx_stream, mut rx_stream) = stream.split();
 
@@ -68,7 +71,7 @@ async fn main() -> Result<()> {
         info!("Listener task closed.");
     });
 
-    for i in 0..3 {
+    for i in 0..9 {
         let mut buf = Vec::new();
         let data: Message = Message {
             status: 200,
@@ -79,7 +82,7 @@ async fn main() -> Result<()> {
         tx_stream.send("message", buf).await?;
         info!("[Realtime Out] Sent message #{}", i);
 
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
     tx_stream.send("leave", Vec::new()).await?;

@@ -13,6 +13,12 @@ pub struct RealtimeMessage {
     pub payload: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RealtimeMode {
+    Unrealible,
+    Reliable,
+}
+
 impl RealtimeMessage {
     pub fn new(event: impl Into<String>, channel: impl Into<String>, payload: Vec<u8>) -> Self {
         Self {

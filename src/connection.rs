@@ -1,3 +1,4 @@
+use bytes::BytesMut;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,6 +18,7 @@ pub struct StreamMeta {
     pub stream_id: u64,
     pub stream_type: StreamType,
     pub channel: Option<String>,
+    pub buffer: BytesMut,
 }
 
 pub struct QuicConnection {
@@ -93,22 +95,16 @@ impl QuicConnection {
         Ok(())
     }
 
-    pub async fn open_realtime_stream(&self, channel: &str) -> Result<u64> {
+    pub async fn open_realtime_stream(&self, stream_id: u64, channel: &str) -> Result<u64> {
         let mut quic = self.quic.lock().await;
 
-        let stream_id = quic.peer_streams_left_bidi();
-
-        let handshake = RealtimeMessage {
-            event: "join".to_string(),
-            channel: channel.to_string(),
-            payload: Vec::new(),
-        };
-
-        let mut buf: Vec<u8> = Vec::new();
-
+        let handshake = RealtimeMessage::new("join", channel, vec![]);
+        let mut buf = Vec::new();
         serde_json::to_writer(&mut buf, &handshake)?;
-        let len = (buf.len() as u32).to_be_bytes();
-        quic.stream_send(stream_id, &len, false)?;
+
+        let len_prefix = (buf.len() as u32).to_be_bytes();
+
+        quic.stream_send(stream_id, &len_prefix, false)?;
         quic.stream_send(stream_id, &buf, false)?;
 
         let mut streams = self.streams.lock().await;
@@ -118,12 +114,13 @@ impl QuicConnection {
                 stream_id,
                 stream_type: StreamType::Realtime,
                 channel: Some(channel.to_string()),
+                buffer: BytesMut::with_capacity(8192),
             },
         );
 
         debug!(
-            "Opened realtime stream {} for channel '{}' on conn {}",
-            stream_id, channel, self.conn_id
+            "opened realtime stream {} for channel '{}'",
+            stream_id, channel
         );
 
         Ok(stream_id)

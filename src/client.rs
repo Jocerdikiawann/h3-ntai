@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 use crate::config::QuicConfig;
 use crate::connection::QuicConnection;
 use crate::error::{H3Error, Result};
-use crate::realtime::{RealtimeEvent, RealtimeMessage, parse_realtime_frame};
+use crate::realtime::{RealtimeEvent, RealtimeMessage, RealtimeMode, parse_realtime_frame};
 
 pub struct H3Client {
     server_addr: SocketAddr,
@@ -34,6 +34,7 @@ pub struct RealtimeStreamHandle {
     pub rx: mpsc::Receiver<RealtimeMessage>,
     pub channel: String,
     pub socket: Arc<UdpSocket>,
+    pub mode: RealtimeMode,
 }
 
 impl RealtimeStreamHandle {
@@ -41,13 +42,23 @@ impl RealtimeStreamHandle {
         let msg = RealtimeMessage::new(event, &self.channel, payload);
         let json_frame = crate::realtime::encode_realtime_frame(&msg)?;
 
-        let mut final_payload = crate::realtime::encode_quic_varint(self.stream_id);
-        final_payload.extend_from_slice(&json_frame);
+        if self.mode == RealtimeMode::Unrealible {
+            let mut final_payload = crate::realtime::encode_quic_varint(self.stream_id);
+            final_payload.extend_from_slice(&json_frame);
 
-        {
-            let mut quic = self.conn.quic.lock().await;
-            if let Err(e) = quic.dgram_send(&final_payload) {
-                tracing::warn!("failed send datagram: {}", e);
+            {
+                let mut quic = self.conn.quic.lock().await;
+                if let Err(e) = quic.dgram_send(&final_payload) {
+                    tracing::warn!("failed send datagram: {}", e);
+                }
+            }
+        } else {
+            {
+                let mut quic = self.conn.quic.lock().await;
+                let mut h3g = self.conn.h3.lock().await;
+                if let Some(h3) = h3g.as_mut() {
+                    h3.send_body(&mut *quic, self.stream_id, &json_frame, false)?;
+                }
             }
         }
 
@@ -65,13 +76,13 @@ impl RealtimeStreamHandle {
             };
             let _ = self.socket.send(&out[..write]).await;
         }
-
         Ok(())
     }
 
     pub async fn recv(&mut self) -> Option<RealtimeMessage> {
         self.rx.recv().await
     }
+
     pub fn split(
         self,
     ) -> (
@@ -84,9 +95,10 @@ impl RealtimeStreamHandle {
         let sender_only = Self {
             stream_id: self.stream_id,
             conn: self.conn,
-            rx: dummy_rx, // Tidak akan dipakai lagi
+            rx: dummy_rx,
             channel: self.channel,
             socket: self.socket,
+            mode: self.mode,
         };
 
         (std::sync::Arc::new(sender_only), rx)
@@ -498,20 +510,33 @@ impl H3ClientConn {
         }
     }
 
-    pub async fn realtime_connect(&self, channel: &str) -> Result<RealtimeStreamHandle> {
+    pub async fn realtime_connect(
+        &self,
+        channel: &str,
+        mode: RealtimeMode,
+    ) -> Result<RealtimeStreamHandle> {
         let path = format!("/realtime?channel={}", channel);
         let session_id = self.webtransport_connect(&path).await?;
 
         let join_msg = RealtimeMessage::new("join", channel, vec![]);
         let join_frame = crate::realtime::encode_realtime_frame(&join_msg)?;
 
-        let mut final_payload = crate::realtime::encode_quic_varint(session_id);
-        final_payload.extend_from_slice(&join_frame);
+        if mode == RealtimeMode::Unrealible {
+            let mut final_payload = crate::realtime::encode_quic_varint(session_id);
+            final_payload.extend_from_slice(&join_frame);
 
-        {
+            {
+                let mut quic = self.conn.quic.lock().await;
+                let _ = quic.dgram_send(&final_payload);
+            }
+        } else {
             let mut quic = self.conn.quic.lock().await;
-            let _ = quic.dgram_send(&final_payload);
+            let mut h3g = self.conn.h3.lock().await;
+            if let Some(h3) = h3g.as_mut() {
+                h3.send_body(&mut *quic, session_id, &join_frame, false)?;
+            }
         }
+
         self.flush().await?;
 
         let (tx, rx) = mpsc::channel(256);
@@ -523,6 +548,7 @@ impl H3ClientConn {
         tokio::spawn(async move {
             let mut recv_buf = BytesMut::zeroed(65535);
             let mut out = BytesMut::zeroed(1350);
+            let mut reliable_buffer = bytes::BytesMut::with_capacity(65535);
 
             loop {
                 let Ok(len) = socket.recv(&mut recv_buf).await else {
@@ -553,19 +579,57 @@ impl H3ClientConn {
                     }
                 }
 
-                let mut dgram_buf = BytesMut::zeroed(65535);
                 let mut quic = conn.quic.lock().await;
+                if mode == RealtimeMode::Unrealible {
+                    let mut dgram_buf = BytesMut::zeroed(65535);
+                    while let Ok(d_len) = quic.dgram_recv(&mut dgram_buf) {
+                        let raw_data = &dgram_buf[..d_len];
+                        if let Some((_sid, varint_len)) =
+                            crate::realtime::decode_quic_varint(raw_data)
+                        {
+                            let actual_json = &raw_data[varint_len..];
+                            if let Some((msg, _)) = parse_realtime_frame(actual_json) {
+                                if tx.send(msg).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let mut h3g = conn.h3.lock().await;
+                    if let Some(h3) = h3g.as_mut() {
+                        loop {
+                            match h3.poll(&mut *quic) {
+                                Ok((sid, quiche::h3::Event::Data)) if sid == session_id => {
+                                    let mut body_buf = bytes::BytesMut::zeroed(65535);
 
-                while let Ok(d_len) = quic.dgram_recv(&mut dgram_buf) {
-                    let raw_data = &dgram_buf[..d_len];
+                                    while let Ok(read) =
+                                        h3.recv_body(&mut *quic, sid, &mut body_buf)
+                                    {
+                                        info!("got bytes {} on stream {}", read, sid);
+                                        reliable_buffer.extend_from_slice(&body_buf[..read]);
 
-                    if let Some((_sid, varint_len)) = crate::realtime::decode_quic_varint(raw_data)
-                    {
-                        let actual_json = &raw_data[varint_len..];
-
-                        if let Some((msg, _)) = parse_realtime_frame(actual_json) {
-                            if tx.send(msg).await.is_err() {
-                                return;
+                                        while let Some((msg, consumed)) =
+                                            parse_realtime_frame(&reliable_buffer)
+                                        {
+                                            use bytes::Buf;
+                                            reliable_buffer.advance(consumed);
+                                            if tx.send(msg).await.is_err() {
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                                Ok((sid, quiche::h3::Event::Finished)) if sid == session_id => {
+                                    info!("reliable stream {} closed by server", sid);
+                                    return;
+                                }
+                                Ok(_) => continue,
+                                Err(quiche::h3::Error::Done) => break,
+                                Err(e) => {
+                                    warn!("H3 poll error di client: {:?}", e);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -578,6 +642,7 @@ impl H3ClientConn {
             rx,
             channel: String::from(channel),
             socket: Arc::clone(&self.socket),
+            mode: mode,
         })
     }
 
